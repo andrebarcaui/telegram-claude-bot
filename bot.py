@@ -58,6 +58,9 @@ Ferramentas disponíveis:
 - list_events: consultar agenda ("o que tenho amanhã?")
 - create_event: criar evento no calendário ("marcar dentista sexta 15h")
 - set_reminder: agendar lembrete no Telegram ("me lembra às 6h30 de segunda de X")
+- web_search: pesquisar na web por informações atualizadas ("pesquise X", "o que está acontecendo com Y")
+
+Quando pesquisar na web, organize um relatório claro e inclua as fontes no final.
 
 Regras obrigatórias:
 - Leitura é livre; qualquer ação de escrita, exclusão, movimentação ou envio \
@@ -229,6 +232,46 @@ def format_confirm(action: dict) -> str:
         )
 
 
+WEB_TOOLS = [
+    {"type": "web_search_20260209", "name": "web_search"},
+]
+
+MAX_MSG_LEN = 4096
+
+
+def _extract_response(response):
+    tool_use_block = None
+    text_parts = []
+    citations = []
+    for block in response.content:
+        if block.type == "tool_use":
+            tool_use_block = block
+        elif block.type == "text":
+            text_parts.append(block.text)
+            if hasattr(block, "citations") and block.citations:
+                for cite in block.citations:
+                    url = getattr(cite, "url", None)
+                    if url:
+                        citations.append({
+                            "url": url,
+                            "title": getattr(cite, "title", ""),
+                        })
+    return tool_use_block, text_parts, citations
+
+
+def _format_sources(citations: list[dict]) -> str:
+    if not citations:
+        return ""
+    seen = set()
+    sources = []
+    for c in citations:
+        if c["url"] not in seen:
+            seen.add(c["url"])
+            title = c["title"] or c["url"]
+            sources.append(f"- {title}\n  {c['url']}")
+    return "\n\nFontes:\n" + "\n".join(sources)
+
+
 def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
     history = chat_histories[chat_id]
     history.append({"role": "user", "content": user_text})
@@ -237,22 +280,43 @@ def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
         history[:] = history[-MAX_HISTORY:]
 
     system_prompt = get_system_prompt(chat_id)
+    all_tools = TOOLS + WEB_TOOLS
 
     response = claude.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=4096,
+        max_tokens=16000,
         system=system_prompt,
-        tools=TOOLS,
+        tools=all_tools,
         messages=history,
     )
 
-    tool_use_block = None
-    text_parts = []
-    for block in response.content:
-        if block.type == "tool_use":
-            tool_use_block = block
-        elif block.type == "text":
-            text_parts.append(block.text)
+    all_text = []
+    all_citations = []
+    restarts = 0
+    while response.stop_reason == "pause_turn" and restarts < 5:
+        for block in response.content:
+            if block.type == "text":
+                all_text.append(block.text)
+                if hasattr(block, "citations") and block.citations:
+                    for cite in block.citations:
+                        url = getattr(cite, "url", None)
+                        if url:
+                            all_citations.append({"url": url, "title": getattr(cite, "title", "")})
+        resume_messages = list(history) + [
+            {"role": "assistant", "content": response.content},
+        ]
+        response = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=16000,
+            system=system_prompt,
+            tools=all_tools,
+            messages=resume_messages,
+        )
+        restarts += 1
+
+    tool_use_block, text_parts, citations = _extract_response(response)
+    all_text.extend(text_parts)
+    all_citations.extend(citations)
 
     if tool_use_block and tool_use_block.name == "list_events":
         result = execute_list_events(**tool_use_block.input, chat_id=chat_id)
@@ -273,17 +337,15 @@ def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
 
         final_response = claude.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=4096,
+            max_tokens=16000,
             system=system_prompt,
-            tools=TOOLS,
+            tools=all_tools,
             messages=followup_messages,
         )
 
-        reply = ""
-        for block in final_response.content:
-            if block.type == "text":
-                reply += block.text
-        reply = reply or result
+        _, final_text, final_citations = _extract_response(final_response)
+        reply = "".join(final_text) or result
+        reply += _format_sources(final_citations)
 
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY:
@@ -306,7 +368,8 @@ def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
             history[:] = history[-MAX_HISTORY:]
         return reply, action
 
-    reply = "".join(text_parts) or "Sem resposta."
+    reply = "".join(all_text) or "Sem resposta."
+    reply += _format_sources(all_citations)
     history.append({"role": "assistant", "content": reply})
     if len(history) > MAX_HISTORY:
         history[:] = history[-MAX_HISTORY:]
@@ -374,6 +437,11 @@ async def execute_confirmed_action(
         return f"Lembrete agendado para {remind_at.strftime('%d/%m/%Y às %H:%M')}!"
 
 
+async def send_reply(update: Update, text: str) -> None:
+    for i in range(0, len(text), MAX_MSG_LEN):
+        await update.message.reply_text(text[i:i + MAX_MSG_LEN])
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_text = update.message.text
     chat_id = update.effective_chat.id
@@ -388,17 +456,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             if lower in ("sim", "s", "yes", "y", "ok", "pode", "confirma"):
                 result = await execute_confirmed_action(action, chat_id, context)
                 history.append({"role": "assistant", "content": result})
-                await update.message.reply_text(result)
+                await send_reply(update, result)
             else:
                 cancel = "Ok, cancelado."
                 history.append({"role": "assistant", "content": cancel})
                 await update.message.reply_text(cancel)
             return
 
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         reply, pending = ask_claude(chat_id, user_text)
         if pending:
             pending_actions[chat_id] = pending
-        await update.message.reply_text(reply)
+        await send_reply(update, reply)
     except Exception as e:
         logger.exception("Erro ao processar mensagem")
         await update.message.reply_text(f"Erro: {e}")
@@ -420,10 +489,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         user_text = transcription.text
         logger.info("Transcrição: %s", user_text)
 
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         reply, pending = ask_claude(chat_id, user_text)
         if pending:
             pending_actions[chat_id] = pending
-        await update.message.reply_text(reply)
+        await send_reply(update, reply)
     except Exception as e:
         logger.exception("Erro ao processar áudio")
         await update.message.reply_text(f"Erro ao processar áudio: {e}")
