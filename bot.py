@@ -21,7 +21,7 @@ MAX_HISTORY = 20
 TZ = ZoneInfo("America/Sao_Paulo")
 
 chat_histories: dict[int, list[dict]] = defaultdict(list)
-pending_events: dict[int, dict] = {}
+pending_actions: dict[int, dict] = {}
 
 
 def get_whisper():
@@ -45,10 +45,12 @@ DAYS_PT = [
 SYSTEM_PROMPT_TEMPLATE = """\
 Você é o Barca, um assistente inteligente no Telegram. \
 Responda de forma útil, clara e concisa em português do Brasil.
-Hoje é {today}. Use essa data como referência para "amanhã", "sexta", etc.
+Hoje é {today} ({now}). Use como referência para "amanhã", "sexta", etc.
 
-Você tem acesso ao calendário do usuário via ferramentas. \
-Use list_events para consultar e create_event para criar eventos.
+Ferramentas disponíveis:
+- list_events: consultar agenda ("o que tenho amanhã?")
+- create_event: criar evento no calendário ("marcar dentista sexta 15h")
+- set_reminder: agendar lembrete no Telegram ("me lembra às 6h30 de segunda de X")
 
 Regras obrigatórias:
 - Leitura é livre; qualquer ação de escrita, exclusão, movimentação ou envio \
@@ -58,10 +60,10 @@ exige confirmação explícita do usuário antes de executar.
 - Se você não sabe ou não consegue fazer algo, diga honestamente — nunca invente.\
 """
 
-CALENDAR_TOOLS = [
+TOOLS = [
     {
         "name": "list_events",
-        "description": "Lista eventos do calendário em um período. Use para consultas como 'o que tenho amanhã?', 'minha agenda da semana', etc.",
+        "description": "Lista eventos do calendário em um período.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -74,7 +76,7 @@ CALENDAR_TOOLS = [
     },
     {
         "name": "create_event",
-        "description": "Cria um novo evento no calendário. Use para 'marcar dentista sexta 15h', 'agendar reunião amanhã às 10h', etc.",
+        "description": "Cria um novo evento no calendário.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -86,13 +88,27 @@ CALENDAR_TOOLS = [
             "additionalProperties": False,
         },
     },
+    {
+        "name": "set_reminder",
+        "description": "Agenda um lembrete que será enviado no Telegram na data/hora especificada.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reminder_text": {"type": "string", "description": "Texto do lembrete"},
+                "remind_at": {"type": "string", "description": "Data e hora do lembrete (YYYY-MM-DDTHH:MM:SS)"},
+            },
+            "required": ["reminder_text", "remind_at"],
+            "additionalProperties": False,
+        },
+    },
 ]
 
 
 def get_system_prompt() -> str:
     now = datetime.now(TZ)
     today_str = f"{DAYS_PT[now.weekday()]}, {now.strftime('%d/%m/%Y')}"
-    return SYSTEM_PROMPT_TEMPLATE.format(today=today_str)
+    now_str = now.strftime("%H:%M")
+    return SYSTEM_PROMPT_TEMPLATE.format(today=today_str, now=now_str)
 
 
 def execute_list_events(start_date: str, end_date: str) -> str:
@@ -149,10 +165,47 @@ def execute_create_event(
         )
 
         cal.save_event(ical_str)
-        return f"Evento '{title}' criado com sucesso para {start.strftime('%d/%m/%Y às %H:%M')}!"
+        return f"Evento '{title}' criado para {start.strftime('%d/%m/%Y às %H:%M')}!"
     except Exception as e:
         logger.exception("Erro ao criar evento")
         return f"Erro ao criar evento: {e}"
+
+
+async def fire_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = context.job.chat_id
+    text = context.job.data
+    logger.info("Disparando lembrete para chat %s: %s", chat_id, text)
+    await context.bot.send_message(chat_id=chat_id, text=f"Lembrete: {text}")
+
+
+def format_confirm(action: dict) -> str:
+    if action["type"] == "event":
+        d = action["data"]
+        try:
+            dt = datetime.strptime(d["start_datetime"], "%Y-%m-%dT%H:%M:%S")
+            formatted = dt.strftime("%d/%m/%Y às %H:%M")
+        except ValueError:
+            formatted = d["start_datetime"]
+        return (
+            f"Posso criar este evento?\n\n"
+            f"{d['title']}\n"
+            f"{formatted}\n"
+            f"Duração: {d.get('duration_minutes', 60)} min\n\n"
+            f"Confirma? (sim/não)"
+        )
+    else:
+        d = action["data"]
+        try:
+            dt = datetime.strptime(d["remind_at"], "%Y-%m-%dT%H:%M:%S")
+            formatted = dt.strftime("%d/%m/%Y às %H:%M")
+        except ValueError:
+            formatted = d["remind_at"]
+        return (
+            f"Agendar este lembrete?\n\n"
+            f"{d['reminder_text']}\n"
+            f"{formatted}\n\n"
+            f"Confirma? (sim/não)"
+        )
 
 
 def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
@@ -168,7 +221,7 @@ def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
         model="claude-sonnet-4-6",
         max_tokens=4096,
         system=system_prompt,
-        tools=CALENDAR_TOOLS,
+        tools=TOOLS,
         messages=history,
     )
 
@@ -201,7 +254,7 @@ def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
             model="claude-sonnet-4-6",
             max_tokens=4096,
             system=system_prompt,
-            tools=CALENDAR_TOOLS,
+            tools=TOOLS,
             messages=followup_messages,
         )
 
@@ -217,29 +270,20 @@ def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
         return reply, None
 
     elif tool_use_block and tool_use_block.name == "create_event":
-        event_data = tool_use_block.input
-        title = event_data.get("title", "")
-        start_dt = event_data.get("start_datetime", "")
-        duration = event_data.get("duration_minutes", 60)
-
-        try:
-            dt = datetime.strptime(start_dt, "%Y-%m-%dT%H:%M:%S")
-            formatted = dt.strftime("%d/%m/%Y às %H:%M")
-        except ValueError:
-            formatted = start_dt
-
-        reply = (
-            f"Posso criar este evento?\n\n"
-            f"{title}\n"
-            f"{formatted}\n"
-            f"Duração: {duration} min\n\n"
-            f"Confirma? (sim/não)"
-        )
-
+        action = {"type": "event", "data": tool_use_block.input}
+        reply = format_confirm(action)
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY:
             history[:] = history[-MAX_HISTORY:]
-        return reply, event_data
+        return reply, action
+
+    elif tool_use_block and tool_use_block.name == "set_reminder":
+        action = {"type": "reminder", "data": tool_use_block.input}
+        reply = format_confirm(action)
+        history.append({"role": "assistant", "content": reply})
+        if len(history) > MAX_HISTORY:
+            history[:] = history[-MAX_HISTORY:]
+        return reply, action
 
     reply = "".join(text_parts) or "Sem resposta."
     history.append({"role": "assistant", "content": reply})
@@ -251,12 +295,40 @@ def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     chat_histories[chat_id].clear()
-    pending_events.pop(chat_id, None)
+    pending_actions.pop(chat_id, None)
     logger.info("/start de %s", update.effective_user.first_name)
     await update.message.reply_text(
         "Olá! Eu sou o Barca, seu assistente com IA.\n"
-        "Mande texto ou áudio. Posso consultar e criar eventos no seu calendário."
+        "Mande texto ou áudio. Posso consultar/criar eventos e agendar lembretes."
     )
+
+
+async def execute_confirmed_action(
+    action: dict, chat_id: int, context: ContextTypes.DEFAULT_TYPE
+) -> str:
+    if action["type"] == "event":
+        d = action["data"]
+        return execute_create_event(
+            title=d["title"],
+            start_datetime=d["start_datetime"],
+            duration_minutes=d.get("duration_minutes", 60),
+        )
+    else:
+        d = action["data"]
+        remind_at = datetime.strptime(d["remind_at"], "%Y-%m-%dT%H:%M:%S").replace(
+            tzinfo=TZ
+        )
+        now = datetime.now(TZ)
+        delay = (remind_at - now).total_seconds()
+        if delay <= 0:
+            return "Esse horário já passou. Escolha um horário futuro."
+        context.job_queue.run_once(
+            fire_reminder,
+            when=delay,
+            chat_id=chat_id,
+            data=d["reminder_text"],
+        )
+        return f"Lembrete agendado para {remind_at.strftime('%d/%m/%Y às %H:%M')}!"
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -265,30 +337,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     logger.info("Mensagem de %s: %s", update.effective_user.first_name, user_text)
 
     try:
-        if chat_id in pending_events:
-            event_data = pending_events.pop(chat_id)
+        if chat_id in pending_actions:
+            action = pending_actions.pop(chat_id)
             lower = user_text.lower().strip()
+            history = chat_histories[chat_id]
+            history.append({"role": "user", "content": user_text})
             if lower in ("sim", "s", "yes", "y", "ok", "pode", "confirma"):
-                result = execute_create_event(
-                    title=event_data["title"],
-                    start_datetime=event_data["start_datetime"],
-                    duration_minutes=event_data.get("duration_minutes", 60),
-                )
-                history = chat_histories[chat_id]
-                history.append({"role": "user", "content": user_text})
+                result = await execute_confirmed_action(action, chat_id, context)
                 history.append({"role": "assistant", "content": result})
                 await update.message.reply_text(result)
             else:
-                history = chat_histories[chat_id]
-                history.append({"role": "user", "content": user_text})
-                cancel = "Ok, evento não criado."
+                cancel = "Ok, cancelado."
                 history.append({"role": "assistant", "content": cancel})
                 await update.message.reply_text(cancel)
             return
 
         reply, pending = ask_claude(chat_id, user_text)
         if pending:
-            pending_events[chat_id] = pending
+            pending_actions[chat_id] = pending
         await update.message.reply_text(reply)
     except Exception as e:
         logger.exception("Erro ao processar mensagem")
@@ -313,7 +379,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         reply, pending = ask_claude(chat_id, user_text)
         if pending:
-            pending_events[chat_id] = pending
+            pending_actions[chat_id] = pending
         await update.message.reply_text(reply)
     except Exception as e:
         logger.exception("Erro ao processar áudio")

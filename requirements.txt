@@ -1,4 +1,4 @@
 anthropic>=1.0.0
 caldav>=1.0.0
 openai>=1.0.0
-python-telegram-bot>=21.0
+python-telegram-bot[job-queue]>=21.0
