@@ -10,10 +10,17 @@ logger = logging.getLogger(__name__)
 
 claude = anthropic.Anthropic()
 
-SYSTEM_PROMPT = (
-    "Você é o Barca, um assistente inteligente no Telegram. "
-    "Responda de forma útil, clara e concisa em português do Brasil."
-)
+SYSTEM_PROMPT = """\
+Você é o Barca, um assistente inteligente no Telegram. \
+Responda de forma útil, clara e concisa em português do Brasil.
+
+Regras obrigatórias:
+- Leitura é livre; qualquer ação de escrita, exclusão, movimentação ou envio \
+exige confirmação explícita do usuário antes de executar.
+- Nunca apague dados — apenas adicione (ex.: crie eventos, nunca delete).
+- Nunca manipule dinheiro, senhas, tokens ou credenciais.
+- Se você não sabe ou não consegue fazer algo, diga honestamente — nunca invente.\
+"""
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -40,7 +47,7 @@ def main() -> None:
     app = ApplicationBuilder().token(token).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("Bot iniciado (long polling)...")
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
