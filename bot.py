@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import anthropic
 import caldav
 import openai
+from timezonefinder import TimezoneFinder
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -18,10 +19,16 @@ logger = logging.getLogger(__name__)
 claude = anthropic.Anthropic()
 
 MAX_HISTORY = 20
-TZ = ZoneInfo("America/Sao_Paulo")
+DEFAULT_TZ = ZoneInfo(os.environ.get("BOT_TIMEZONE", "America/Sao_Paulo"))
+tf = TimezoneFinder()
 
 chat_histories: dict[int, list[dict]] = defaultdict(list)
+chat_timezones: dict[int, ZoneInfo] = {}
 pending_actions: dict[int, dict] = {}
+
+
+def get_tz(chat_id: int) -> ZoneInfo:
+    return chat_timezones.get(chat_id, DEFAULT_TZ)
 
 
 def get_whisper():
@@ -104,22 +111,24 @@ TOOLS = [
 ]
 
 
-def get_system_prompt() -> str:
-    now = datetime.now(timezone.utc).astimezone(TZ)
+def get_system_prompt(chat_id: int) -> str:
+    tz = get_tz(chat_id)
+    now = datetime.now(timezone.utc).astimezone(tz)
     today_str = f"{DAYS_PT[now.weekday()]}, {now.strftime('%d/%m/%Y')}"
     now_str = now.strftime("%H:%M")
     return SYSTEM_PROMPT_TEMPLATE.format(today=today_str, now=now_str)
 
 
-def execute_list_events(start_date: str, end_date: str) -> str:
+def execute_list_events(start_date: str, end_date: str, chat_id: int) -> str:
     try:
+        tz = get_tz(chat_id)
         principal = get_caldav_principal()
         calendars = principal.calendars()
         logger.info("Calendários encontrados: %s", [c.name for c in calendars])
 
-        start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=TZ)
+        start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=tz)
         end = datetime.strptime(end_date, "%Y-%m-%d").replace(
-            hour=23, minute=59, second=59, tzinfo=TZ
+            hour=23, minute=59, second=59, tzinfo=tz
         )
 
         lines = []
@@ -145,12 +154,14 @@ def execute_list_events(start_date: str, end_date: str) -> str:
 
 
 def execute_create_event(
-    title: str, start_datetime: str, duration_minutes: int = 60
+    title: str, start_datetime: str, chat_id: int, duration_minutes: int = 60
 ) -> str:
     try:
+        tz = get_tz(chat_id)
+        tz_name = str(tz)
         cal = get_caldav_principal().calendars()[0]
         start = datetime.strptime(start_datetime, "%Y-%m-%dT%H:%M:%S").replace(
-            tzinfo=TZ
+            tzinfo=tz
         )
         end = start + timedelta(minutes=duration_minutes)
         uid = str(uuid.uuid4())
@@ -162,8 +173,8 @@ def execute_create_event(
             "BEGIN:VEVENT\r\n"
             f"UID:{uid}\r\n"
             f"SUMMARY:{title}\r\n"
-            f"DTSTART;TZID=America/Sao_Paulo:{start.strftime('%Y%m%dT%H%M%S')}\r\n"
-            f"DTEND;TZID=America/Sao_Paulo:{end.strftime('%Y%m%dT%H%M%S')}\r\n"
+            f"DTSTART;TZID={tz_name}:{start.strftime('%Y%m%dT%H%M%S')}\r\n"
+            f"DTEND;TZID={tz_name}:{end.strftime('%Y%m%dT%H%M%S')}\r\n"
             "END:VEVENT\r\n"
             "END:VCALENDAR\r\n"
         )
@@ -219,7 +230,7 @@ def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
     if len(history) > MAX_HISTORY:
         history[:] = history[-MAX_HISTORY:]
 
-    system_prompt = get_system_prompt()
+    system_prompt = get_system_prompt(chat_id)
 
     response = claude.messages.create(
         model="claude-sonnet-4-6",
@@ -238,7 +249,7 @@ def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
             text_parts.append(block.text)
 
     if tool_use_block and tool_use_block.name == "list_events":
-        result = execute_list_events(**tool_use_block.input)
+        result = execute_list_events(**tool_use_block.input, chat_id=chat_id)
 
         followup_messages = list(history) + [
             {"role": "assistant", "content": response.content},
@@ -301,28 +312,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_histories[chat_id].clear()
     pending_actions.pop(chat_id, None)
     logger.info("/start de %s", update.effective_user.first_name)
+    tz = get_tz(chat_id)
     await update.message.reply_text(
         "Olá! Eu sou o Barca, seu assistente com IA.\n"
-        "Mande texto ou áudio. Posso consultar/criar eventos e agendar lembretes."
+        "Mande texto ou áudio. Posso consultar/criar eventos e agendar lembretes.\n\n"
+        f"Fuso horário atual: {tz}\n"
+        "Para ajustar, envie sua localização (clipe > Localização)."
     )
+
+
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    lat = update.message.location.latitude
+    lng = update.message.location.longitude
+    tz_name = tf.timezone_at(lat=lat, lng=lng)
+    if tz_name:
+        chat_timezones[chat_id] = ZoneInfo(tz_name)
+        now = datetime.now(timezone.utc).astimezone(chat_timezones[chat_id])
+        await update.message.reply_text(
+            f"Fuso horário atualizado: {tz_name}\n"
+            f"Hora local: {now.strftime('%d/%m/%Y %H:%M')}"
+        )
+        logger.info("Timezone de chat %s atualizado para %s", chat_id, tz_name)
+    else:
+        await update.message.reply_text("Não consegui detectar o fuso horário dessa localização.")
 
 
 async def execute_confirmed_action(
     action: dict, chat_id: int, context: ContextTypes.DEFAULT_TYPE
 ) -> str:
+    tz = get_tz(chat_id)
     if action["type"] == "event":
         d = action["data"]
         return execute_create_event(
             title=d["title"],
             start_datetime=d["start_datetime"],
+            chat_id=chat_id,
             duration_minutes=d.get("duration_minutes", 60),
         )
     else:
         d = action["data"]
         remind_at = datetime.strptime(d["remind_at"], "%Y-%m-%dT%H:%M:%S").replace(
-            tzinfo=TZ
+            tzinfo=tz
         )
-        now = datetime.now(timezone.utc).astimezone(TZ)
+        now = datetime.now(timezone.utc).astimezone(tz)
         delay = (remind_at - now).total_seconds()
         if delay <= 0:
             return "Esse horário já passou. Escolha um horário futuro."
@@ -401,8 +434,9 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    now = datetime.now(timezone.utc).astimezone(TZ)
-    logger.info("Bot iniciado. Data/hora São Paulo: %s", now.strftime("%d/%m/%Y %H:%M:%S"))
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location))
+    now = datetime.now(timezone.utc).astimezone(DEFAULT_TZ)
+    logger.info("Bot iniciado. Data/hora padrão (%s): %s", DEFAULT_TZ, now.strftime("%d/%m/%Y %H:%M:%S"))
     logger.info("Bot iniciado (long polling)...")
     app.run_polling(drop_pending_updates=True)
 

@@ -2,4 +2,5 @@ anthropic>=1.0.0
 caldav>=1.0.0
 openai>=1.0.0
 python-telegram-bot[job-queue]>=21.0
+timezonefinder>=6.0.0
 tzdata>=2024.1
