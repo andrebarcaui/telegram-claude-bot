@@ -124,7 +124,7 @@ def execute_list_events(start_date: str, end_date: str, chat_id: int) -> str:
         tz = get_tz(chat_id)
         principal = get_caldav_principal()
         calendars = principal.calendars()
-        logger.info("Calendários encontrados: %s", [c.name for c in calendars])
+        logger.info("Calendários encontrados: %d", len(calendars))
 
         start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=tz)
         end = datetime.strptime(end_date, "%Y-%m-%d").replace(
@@ -133,16 +133,22 @@ def execute_list_events(start_date: str, end_date: str, chat_id: int) -> str:
 
         lines = []
         for cal in calendars:
-            results = cal.search(start=start, end=end, event=True, expand=True)
+            try:
+                results = cal.search(start=start, end=end, event=True, expand=True)
+            except Exception:
+                logger.debug("Erro ao buscar em calendário, pulando")
+                continue
             for r in results:
-                vevent = r.vobject_instance.vevent
-                summary = str(vevent.summary.value)
-                dtstart = vevent.dtstart.value
-                if hasattr(dtstart, "strftime"):
-                    time_str = dtstart.strftime("%d/%m/%Y %H:%M")
-                else:
-                    time_str = str(dtstart)
-                lines.append(f"- {summary} ({time_str})")
+                ical = r.icalendar_instance
+                for component in ical.walk():
+                    if component.name == "VEVENT":
+                        summary = str(component.get("SUMMARY", "Sem título"))
+                        dtstart = component.get("DTSTART")
+                        if dtstart and hasattr(dtstart.dt, "strftime"):
+                            time_str = dtstart.dt.strftime("%d/%m/%Y %H:%M")
+                        else:
+                            time_str = str(dtstart.dt) if dtstart else "?"
+                        lines.append(f"- {summary} ({time_str})")
 
         if not lines:
             return "Nenhum evento encontrado nesse período."
