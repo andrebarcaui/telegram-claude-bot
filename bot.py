@@ -10,6 +10,11 @@ logger = logging.getLogger(__name__)
 
 claude = anthropic.Anthropic()
 
+SYSTEM_PROMPT = (
+    "Você é o Barca, um assistente inteligente no Telegram. "
+    "Responda de forma útil, clara e concisa em português do Brasil."
+)
+
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_text = update.message.text
@@ -18,6 +23,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     response = claude.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=4096,
+        system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_text}],
     )
 
