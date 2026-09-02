@@ -3,7 +3,7 @@ import logging
 import tempfile
 import uuid
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import anthropic
@@ -105,7 +105,7 @@ TOOLS = [
 
 
 def get_system_prompt() -> str:
-    now = datetime.now(TZ)
+    now = datetime.now(timezone.utc).astimezone(TZ)
     today_str = f"{DAYS_PT[now.weekday()]}, {now.strftime('%d/%m/%Y')}"
     now_str = now.strftime("%H:%M")
     return SYSTEM_PROMPT_TEMPLATE.format(today=today_str, now=now_str)
@@ -322,7 +322,7 @@ async def execute_confirmed_action(
         remind_at = datetime.strptime(d["remind_at"], "%Y-%m-%dT%H:%M:%S").replace(
             tzinfo=TZ
         )
-        now = datetime.now(TZ)
+        now = datetime.now(timezone.utc).astimezone(TZ)
         delay = (remind_at - now).total_seconds()
         if delay <= 0:
             return "Esse horário já passou. Escolha um horário futuro."
@@ -401,7 +401,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    now = datetime.now(TZ)
+    now = datetime.now(timezone.utc).astimezone(TZ)
     logger.info("Bot iniciado. Data/hora São Paulo: %s", now.strftime("%d/%m/%Y %H:%M:%S"))
     logger.info("Bot iniciado (long polling)...")
     app.run_polling(drop_pending_updates=True)
