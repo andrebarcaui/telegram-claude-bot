@@ -28,13 +28,13 @@ def get_whisper():
     return openai.OpenAI()
 
 
-def get_calendar():
+def get_caldav_principal():
     client = caldav.DAVClient(
         url="https://caldav.icloud.com",
         username=os.environ["ICLOUD_EMAIL"],
         password=os.environ["ICLOUD_APP_PASSWORD"],
     )
-    return client.principal().calendars()[0]
+    return client.principal()
 
 
 DAYS_PT = [
@@ -113,26 +113,30 @@ def get_system_prompt() -> str:
 
 def execute_list_events(start_date: str, end_date: str) -> str:
     try:
-        cal = get_calendar()
+        principal = get_caldav_principal()
+        calendars = principal.calendars()
+        logger.info("Calendários encontrados: %s", [c.name for c in calendars])
+
         start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=TZ)
         end = datetime.strptime(end_date, "%Y-%m-%d").replace(
             hour=23, minute=59, second=59, tzinfo=TZ
         )
-        results = cal.search(start=start, end=end, event=True, expand=True)
-
-        if not results:
-            return "Nenhum evento encontrado nesse período."
 
         lines = []
-        for r in results:
-            vevent = r.vobject_instance.vevent
-            summary = str(vevent.summary.value)
-            dtstart = vevent.dtstart.value
-            if hasattr(dtstart, "strftime"):
-                time_str = dtstart.strftime("%d/%m/%Y %H:%M")
-            else:
-                time_str = str(dtstart)
-            lines.append(f"- {summary} ({time_str})")
+        for cal in calendars:
+            results = cal.search(start=start, end=end, event=True, expand=True)
+            for r in results:
+                vevent = r.vobject_instance.vevent
+                summary = str(vevent.summary.value)
+                dtstart = vevent.dtstart.value
+                if hasattr(dtstart, "strftime"):
+                    time_str = dtstart.strftime("%d/%m/%Y %H:%M")
+                else:
+                    time_str = str(dtstart)
+                lines.append(f"- {summary} ({time_str})")
+
+        if not lines:
+            return "Nenhum evento encontrado nesse período."
 
         return "\n".join(lines)
     except Exception as e:
@@ -144,7 +148,7 @@ def execute_create_event(
     title: str, start_datetime: str, duration_minutes: int = 60
 ) -> str:
     try:
-        cal = get_calendar()
+        cal = get_caldav_principal().calendars()[0]
         start = datetime.strptime(start_datetime, "%Y-%m-%dT%H:%M:%S").replace(
             tzinfo=TZ
         )
@@ -397,6 +401,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    now = datetime.now(TZ)
+    logger.info("Bot iniciado. Data/hora São Paulo: %s", now.strftime("%d/%m/%Y %H:%M:%S"))
     logger.info("Bot iniciado (long polling)...")
     app.run_polling(drop_pending_updates=True)
 
