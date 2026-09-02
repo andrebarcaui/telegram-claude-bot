@@ -1,3 +1,4 @@
+import json
 import os
 import logging
 import tempfile
@@ -21,6 +22,8 @@ claude = anthropic.Anthropic()
 MAX_HISTORY = 20
 DEFAULT_TZ = ZoneInfo(os.environ.get("BOT_TIMEZONE", "America/Sao_Paulo"))
 tf = TimezoneFinder()
+
+NOTES_FILE = os.environ.get("NOTES_FILE", "/data/notes.json")
 
 chat_histories: dict[int, list[dict]] = defaultdict(list)
 chat_timezones: dict[int, ZoneInfo] = {}
@@ -59,8 +62,12 @@ Ferramentas disponíveis:
 - create_event: criar evento no calendário ("marcar dentista sexta 15h")
 - set_reminder: agendar lembrete no Telegram ("me lembra às 6h30 de segunda de X")
 - web_search: pesquisar na web por informações atualizadas ("pesquise X", "o que está acontecendo com Y")
+- save_note: salvar uma nota organizada por assunto ("anote: ideia para app de receitas")
+- list_notes: listar notas salvas ("quais minhas notas?", "notas sobre ideias")
 
 Quando pesquisar na web, organize um relatório claro e inclua as fontes no final.
+Quando o usuário pedir para anotar algo, categorize automaticamente por assunto \
+com base no conteúdo. Não peça confirmação para anotar — o comando já é a intenção.
 
 Regras obrigatórias:
 - Leitura é livre; qualquer ação de escrita, exclusão, movimentação ou envio \
@@ -108,6 +115,30 @@ TOOLS = [
                 "remind_at": {"type": "string", "description": "Data e hora do lembrete (YYYY-MM-DDTHH:MM:SS)"},
             },
             "required": ["reminder_text", "remind_at"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "save_note",
+        "description": "Salva uma nota organizada por assunto. Use quando o usuário pedir para anotar algo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "Assunto/categoria da nota (ex: ideias, trabalho, projetos)"},
+                "text": {"type": "string", "description": "Conteúdo da nota"},
+            },
+            "required": ["subject", "text"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "list_notes",
+        "description": "Lista notas salvas, opcionalmente filtradas por assunto.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "Filtrar por assunto (opcional, se omitido lista todos)"},
+            },
             "additionalProperties": False,
         },
     },
@@ -193,6 +224,64 @@ def execute_create_event(
     except Exception as e:
         logger.exception("Erro ao criar evento")
         return f"Erro ao criar evento: {e}"
+
+
+def load_notes() -> dict:
+    try:
+        with open(NOTES_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_notes_to_file(notes: dict) -> None:
+    os.makedirs(os.path.dirname(NOTES_FILE) or ".", exist_ok=True)
+    with open(NOTES_FILE, "w") as f:
+        json.dump(notes, f, ensure_ascii=False, indent=2)
+
+
+def execute_save_note(subject: str, text: str, chat_id: int) -> str:
+    try:
+        tz = get_tz(chat_id)
+        now = datetime.now(timezone.utc).astimezone(tz)
+        notes = load_notes()
+        if subject not in notes:
+            notes[subject] = []
+        notes[subject].append({
+            "text": text,
+            "timestamp": now.strftime("%d/%m/%Y %H:%M"),
+        })
+        save_notes_to_file(notes)
+        total = len(notes[subject])
+        return f"Nota salva em '{subject}' ({total} nota(s) nesse assunto)."
+    except Exception as e:
+        logger.exception("Erro ao salvar nota")
+        return f"Erro ao salvar nota: {e}"
+
+
+def execute_list_notes(subject: str = None) -> str:
+    try:
+        notes = load_notes()
+        if not notes:
+            return "Nenhuma nota salva ainda."
+        if subject:
+            items = notes.get(subject)
+            if not items:
+                subjects = ", ".join(notes.keys())
+                return f"Nenhuma nota sobre '{subject}'. Assuntos disponíveis: {subjects}"
+            lines = [f"Notas sobre '{subject}':"]
+            for item in items:
+                lines.append(f"- {item['text']} ({item['timestamp']})")
+            return "\n".join(lines)
+        lines = []
+        for subj, items in notes.items():
+            lines.append(f"\n{subj} ({len(items)}):")
+            for item in items:
+                lines.append(f"  - {item['text']} ({item['timestamp']})")
+        return "Suas notas:" + "\n".join(lines)
+    except Exception as e:
+        logger.exception("Erro ao listar notas")
+        return f"Erro ao listar notas: {e}"
 
 
 async def fire_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -318,8 +407,14 @@ def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
     all_text.extend(text_parts)
     all_citations.extend(citations)
 
-    if tool_use_block and tool_use_block.name == "list_events":
-        result = execute_list_events(**tool_use_block.input, chat_id=chat_id)
+    immediate_tools = {"list_events", "save_note", "list_notes"}
+    if tool_use_block and tool_use_block.name in immediate_tools:
+        if tool_use_block.name == "list_events":
+            result = execute_list_events(**tool_use_block.input, chat_id=chat_id)
+        elif tool_use_block.name == "save_note":
+            result = execute_save_note(**tool_use_block.input, chat_id=chat_id)
+        else:
+            result = execute_list_notes(**tool_use_block.input)
 
         followup_messages = list(history) + [
             {"role": "assistant", "content": response.content},
