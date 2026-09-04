@@ -47,6 +47,31 @@ def get_caldav_principal():
     return client.principal()
 
 
+def get_dropbox():
+    import dropbox as dbx_lib
+    refresh_token = os.environ.get("DROPBOX_REFRESH_TOKEN")
+    if not refresh_token:
+        raise RuntimeError(
+            "Dropbox não configurado. Defina DROPBOX_APP_KEY, "
+            "DROPBOX_APP_SECRET e DROPBOX_REFRESH_TOKEN."
+        )
+    return dbx_lib.Dropbox(
+        oauth2_refresh_token=refresh_token,
+        app_key=os.environ["DROPBOX_APP_KEY"],
+        app_secret=os.environ["DROPBOX_APP_SECRET"],
+    )
+
+
+def _format_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes // 1024} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+
+
 DAYS_PT = [
     "segunda-feira", "terça-feira", "quarta-feira",
     "quinta-feira", "sexta-feira", "sábado", "domingo",
@@ -64,10 +89,15 @@ Ferramentas disponíveis:
 - web_search: pesquisar na web por informações atualizadas ("pesquise X", "o que está acontecendo com Y")
 - save_note: salvar uma nota organizada por assunto ("anote: ideia para app de receitas")
 - list_notes: listar notas salvas ("quais minhas notas?", "notas sobre ideias")
+- search_dropbox: pesquisar arquivos no Dropbox ("procure no Dropbox o arquivo X")
+- list_dropbox: listar conteúdo de uma pasta do Dropbox ("o que tem na pasta Documents?")
+- download_dropbox: baixar e enviar um arquivo do Dropbox ("me manda o arquivo X do Dropbox")
 
 Quando pesquisar na web, organize um relatório claro e inclua as fontes no final.
 Quando o usuário pedir para anotar algo, categorize automaticamente por assunto \
 com base no conteúdo. Não peça confirmação para anotar — o comando já é a intenção.
+Ao pesquisar no Dropbox, mostre os resultados com nome, caminho e tamanho. \
+Para baixar, use download_dropbox com o caminho exato do arquivo encontrado.
 
 Regras obrigatórias:
 - Leitura é livre; qualquer ação de escrita, exclusão, movimentação ou envio \
@@ -139,6 +169,48 @@ TOOLS = [
             "properties": {
                 "subject": {"type": "string", "description": "Filtrar por assunto (opcional, se omitido lista todos)"},
             },
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "search_dropbox",
+        "description": "Pesquisa arquivos no Dropbox do usuário por nome ou conteúdo.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Termo de busca"},
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "list_dropbox",
+        "description": "Lista o conteúdo de uma pasta do Dropbox.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "folder_path": {
+                    "type": "string",
+                    "description": "Caminho da pasta (ex: /Documents). Use string vazia para a raiz.",
+                },
+            },
+            "required": ["folder_path"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "download_dropbox",
+        "description": "Baixa um arquivo do Dropbox e envia ao usuário no Telegram.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Caminho completo do arquivo no Dropbox (ex: /Documents/report.pdf)",
+                },
+            },
+            "required": ["file_path"],
             "additionalProperties": False,
         },
     },
@@ -284,6 +356,51 @@ def execute_list_notes(subject: str = None) -> str:
         return f"Erro ao listar notas: {e}"
 
 
+def execute_search_dropbox(query: str) -> str:
+    try:
+        dbx = get_dropbox()
+        result = dbx.files_search_v2(query)
+        if not result.matches:
+            return f"Nenhum arquivo encontrado para '{query}'."
+        lines = []
+        for match in result.matches[:15]:
+            metadata = match.metadata.get_metadata()
+            name = metadata.name
+            path = metadata.path_display
+            size = getattr(metadata, "size", None)
+            size_str = f" ({_format_size(size)})" if size else ""
+            lines.append(f"- {name}{size_str}\n  {path}")
+        total = len(result.matches)
+        if total > 15:
+            lines.append(f"\n... e mais {total - 15} resultados")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.exception("Erro ao pesquisar Dropbox")
+        return f"Erro ao pesquisar no Dropbox: {e}"
+
+
+def execute_list_dropbox(folder_path: str) -> str:
+    try:
+        dbx = get_dropbox()
+        path = folder_path if folder_path != "/" else ""
+        result = dbx.files_list_folder(path)
+        if not result.entries:
+            return f"Pasta '{folder_path}' está vazia."
+        lines = []
+        for entry in result.entries:
+            size = getattr(entry, "size", None)
+            if size is not None:
+                lines.append(f"- {entry.name} ({_format_size(size)})\n  {entry.path_display}")
+            else:
+                lines.append(f"- {entry.name}/\n  {entry.path_display}")
+        if result.has_more:
+            lines.append(f"\n... e mais arquivos")
+        return "\n".join(lines)
+    except Exception as e:
+        logger.exception("Erro ao listar pasta Dropbox")
+        return f"Erro ao listar pasta: {e}"
+
+
 async def fire_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.chat_id
     text = context.job.data
@@ -304,6 +421,13 @@ def format_confirm(action: dict) -> str:
             f"{d['title']}\n"
             f"{formatted}\n"
             f"Duração: {d.get('duration_minutes', 60)} min\n\n"
+            f"Confirma? (sim/não)"
+        )
+    elif action["type"] == "download":
+        d = action["data"]
+        return (
+            f"Enviar este arquivo do Dropbox?\n\n"
+            f"{d['file_path']}\n\n"
             f"Confirma? (sim/não)"
         )
     else:
@@ -407,12 +531,16 @@ def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
     all_text.extend(text_parts)
     all_citations.extend(citations)
 
-    immediate_tools = {"list_events", "save_note", "list_notes"}
+    immediate_tools = {"list_events", "save_note", "list_notes", "search_dropbox", "list_dropbox"}
     if tool_use_block and tool_use_block.name in immediate_tools:
         if tool_use_block.name == "list_events":
             result = execute_list_events(**tool_use_block.input, chat_id=chat_id)
         elif tool_use_block.name == "save_note":
             result = execute_save_note(**tool_use_block.input, chat_id=chat_id)
+        elif tool_use_block.name == "search_dropbox":
+            result = execute_search_dropbox(**tool_use_block.input)
+        elif tool_use_block.name == "list_dropbox":
+            result = execute_list_dropbox(**tool_use_block.input)
         else:
             result = execute_list_notes(**tool_use_block.input)
 
@@ -457,6 +585,14 @@ def ask_claude(chat_id: int, user_text: str) -> tuple[str, dict | None]:
 
     elif tool_use_block and tool_use_block.name == "set_reminder":
         action = {"type": "reminder", "data": tool_use_block.input}
+        reply = format_confirm(action)
+        history.append({"role": "assistant", "content": reply})
+        if len(history) > MAX_HISTORY:
+            history[:] = history[-MAX_HISTORY:]
+        return reply, action
+
+    elif tool_use_block and tool_use_block.name == "download_dropbox":
+        action = {"type": "download", "data": tool_use_block.input}
         reply = format_confirm(action)
         history.append({"role": "assistant", "content": reply})
         if len(history) > MAX_HISTORY:
@@ -532,6 +668,26 @@ async def execute_confirmed_action(
         return f"Lembrete agendado para {remind_at.strftime('%d/%m/%Y às %H:%M')}!"
 
 
+async def execute_download(action: dict, chat_id: int, update: Update) -> str:
+    try:
+        file_path = action["data"]["file_path"]
+        dbx = get_dropbox()
+        metadata, res = dbx.files_download(file_path)
+        ext = os.path.splitext(file_path)[1] or ".bin"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp.write(res.content)
+            tmp_path = tmp.name
+        try:
+            with open(tmp_path, "rb") as f:
+                await update.message.reply_document(document=f, filename=metadata.name)
+        finally:
+            os.unlink(tmp_path)
+        return f"Arquivo '{metadata.name}' enviado!"
+    except Exception as e:
+        logger.exception("Erro ao baixar do Dropbox")
+        return f"Erro ao baixar arquivo: {e}"
+
+
 async def send_reply(update: Update, text: str) -> None:
     for i in range(0, len(text), MAX_MSG_LEN):
         await update.message.reply_text(text[i:i + MAX_MSG_LEN])
@@ -549,9 +705,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             history = chat_histories[chat_id]
             history.append({"role": "user", "content": user_text})
             if lower in ("sim", "s", "yes", "y", "ok", "pode", "confirma"):
-                result = await execute_confirmed_action(action, chat_id, context)
+                if action["type"] == "download":
+                    result = await execute_download(action, chat_id, update)
+                else:
+                    result = await execute_confirmed_action(action, chat_id, context)
                 history.append({"role": "assistant", "content": result})
-                await send_reply(update, result)
+                if action["type"] != "download" or result.startswith("Erro"):
+                    await send_reply(update, result)
             else:
                 cancel = "Ok, cancelado."
                 history.append({"role": "assistant", "content": cancel})
